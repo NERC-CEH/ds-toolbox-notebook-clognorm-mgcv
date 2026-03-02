@@ -31,6 +31,8 @@ In this notebook, I'll show show to perform this modelling using the popular R p
 
 What does it mean to model log-normal data? What we are saying is that we have some variable, Y, which is $\log_{b}$-normally^[Throughout I use $\log_{b}$ to indicate logarithm to the base $b$ since these calculations work regardless of the base used. When the distribution is referred to informally (i.e., non-mathematically) I drop the base.] distributed so $Y\sim\log_{b}N(\mu,\sigma^{2})$ where $\mu$  is the logarithm of the mean and $\sigma^{2}$ is the base $b$ logarithm of the variance of $Y$. This is equivalent to defining a variable $Z=b^{Y}$ where $Z\sim N(\mu_{*},\sigma_{*}^{2})$. The log-normal distribution is useful in cases where $Y$ is defined over the interval $(0,\infty]$ (i.e., $Y>0$).
 
+Many kinds of sensor-collected data will be subject to some "limit of detection" (LoD), where there is some point at which observations are recorded to be zero because the value is smaller than the sensor can detect, and/or the observation is arbitrarily high due to a saturation effect. Censored normals can be used in this case. Core to their formulation is the separation of the observation into censored and non-censored groups, where the censored likelihood contributions are evaluations of the cumulative distribution function (CDF) of the normal distribution. Censored normal distributions are implemented in `mgcv` in the `cnorm` function.
+
 
 ## Arithmetic versus geometric means
 
@@ -103,6 +105,8 @@ where $g(\boldsymbol{\beta})=b^{X\boldsymbol{\beta}}$ if $b$ is the base we are 
 
 # Analysis of pollutant data
 
+We now start our analysis. This code is based on examples by Mike Dunbar to illustrate fitting a GAMM with censored normal family to water quality time series from multiple sites ([Harmonised Monitoring Scheme sites for England](https://en.wikipedia.org/wiki/Harmonised_monitoring_scheme)) to look at smoothed trends over time and the effects of seasonality. For each determinand we fit a separate model where site is a random effect and we use two temporal smoothers.
+
 We begin by loading the requisite packages.
 
 ```{r libs}
@@ -120,84 +124,50 @@ library(stringr)
 There are some non-CRAN packages required which we can install directly from GitHub, then load:
 
 ```{r extra-libs}
+# for nice scales
 remotes::install_github("christyray/sciscales")
 library(sciscales)
+
+# for the censored log normal helper functions
 remotes::install_github("dill/mgcvUtils")
 library(mgcvUtils)
 ```
 
-Michael Dunbar at the Environment Agency pre-prepared data for this analysis using open data from EA.
+Michael Dunbar at the Environment Agency pre-prepared data for this analysis using open data from EA (extracted using EA APIs).
 
 ```{r data}
 # created in data_prep.R
-load('HMS_open_data.rda')
+load('data/HMS_open_data.rda')
+head(samples)
 ```
 
-as log-transforming we can't use zero as the lower bound for censored values
-we just choose a very small value
-0.00012 is lowest non-censored PFOS value in this dataset
+This data has four determinands, for brevity here we'll just look at one: Nitrate (where `determinand.notation==0117` in our data).
 
-```{r zeros}
-nearly.zero <- 0.000001 # suggest at least 2 orders of magnitude below lowest lod
-log.zero <- log10(nearly.zero)
+```{r nitrate-only}
+samples <- samples |>
+  filter(determinand.notation == "0117")
 ```
-
-```{r detection-code}
-filter.det <- det.list[1]
-
-# reminder of which det code is which
-samples |>
-  group_by(determinand.notation, determinand.label, resultQualifier.notation) |>
-  tally() |>
-  pivot_wider(names_from = resultQualifier.notation, values_from = n)
-```
-
 
 ## Data checking
 
+Plotting the data, we can see how the limit of detection (red) changes over time.^[The censored data is coded in the `resultQualifier.notation` columns with a `<`.]
+
 ```{r data-check}
-# data check
-# we can see that there are some LoDs which change over time
 samples |>
   ggplot() +
   geom_point(aes(x = sample.sampleDateTime,
                  y = result,
                  group = sample.samplingPoint.notation,
-                 col = resultQualifier.notation)) +
-  facet_wrap(~determinand.label, scales = 'free_y') +
-  scale_y_log10() + theme_bw()
-```
-
-```{r}
-# PLOT SOME CDFS IN CASE WE WANT TO DO ARTIFICIAL CENSORING
-samples |>
-  ggplot() +
-  stat_ecdf(aes(y = result), geom = "step") +
-  facet_wrap(~determinand.label, scales = 'free_y') +
-  scale_y_log10() + theme_bw()
-```
-
-```{r}
-
-# this only works for one determinand (currently nitrate)
-censoring.threshold <- 2
-
-samples.filtered <-
-  samples |>
-  filter(determinand.notation %in% det.list[1])
-
-# simple time series plot to look at LoDs
-samples.filtered |>
-  ggplot() +
-  geom_point(aes(x = sample.sampleDateTime, y = result, col = resultQualifier.notation), pch = '+') +
+                 colour = resultQualifier.notation)) +
   scale_y_log10() +
+  labs(x="Date", y="Nitrate", colour="LoD") +
   theme_bw()
 ```
 
 ```{r}
 
 # tabulate LoDs
-samples.filtered |>
+samples |>
   # can comment out
   filter(resultQualifier.notation == '<') |>
   group_by(result) |>
@@ -205,17 +175,26 @@ samples.filtered |>
 ```
 
 
-conclusion - the predominant LoD in the original data is 0.196 although some
-earlier data its 0.5
-I think the value of <0.00001 is an error but leaving it in won't really
-affect the models, just the residuals plots
+The predominant LoD in the original data is 0.196 although some earlier data it is 0.5.
+
+```{r}
+# this only works for one determinand (currently nitrate)
+censoring.threshold <- 2
+```
 
 ## Final data prep
 
+When we log-transform we can't use zero as the lower bound for censored values
+we just choose a very small value. We use a value 2 orders of magnitude below lowest limit of detection.
+
+```{r zeros}
+nearly.zero <- 0.000001
+log.zero <- log10(nearly.zero)
+```
 
 ```{r}
 cen.copy <-
-  samples.filtered |>
+  samples |>
   mutate(result.original = result,
          qualifier.original = resultQualifier.notation,
          resultQualifier.notation = ifelse(result.original < censoring.threshold, '<', NA_character_),
@@ -223,11 +202,9 @@ cen.copy <-
          determinand.notation = paste(determinand.notation, 'artificially censored')
          )
 
-unique(samples$determinand.notation)
-
 # create some extra columns, also mgcv needs categorical variables to be factors
 samples.2 <-
-  bind_rows(samples.filtered, cen.copy) |>
+  bind_rows(samples, cen.copy) |>
   mutate(DATE = date(sample.sampleDateTime),
          year = year(DATE),
          month = month(DATE),
@@ -246,8 +223,6 @@ samples.2 <-
          )
 
 
-unique(samples.2$det.code.desc)
-
 # redo the ecdf check
 # the censored data starting with the vertical line is I think expected
 # behaviour it might not be the correct ecdf for the censored data but that's
@@ -263,13 +238,7 @@ samples.2 |>
 
 # Modelling
 
-We can now fit a generalized additive model.
-
-
-overall aim to look at patterns of chlorophyll over time and relationship to
-other variables including temperature
-Had hoped to include the other inorganic nutrients as explanatory variables
-but there are really too many LoDs to use the data as-is
+We can now fit our generalized additive model.
 
 we want to look at any common trend across our monitoring sites
 
@@ -285,9 +254,14 @@ for uncensored data these should give the same results
 for artificially censored data we can compare the censored model output with
 the raw uncensored data
 
-```{r modelling}
+We need to setup knots for the monthly smoother. Note that we just need to specify the first and last knot, then `mgcv` will fill in evenly-spaced knots in that range. See [this useful blog post by Gavin Simpson about cyclic smoothing](https://fromthebottomoftheheap.net/2014/05/09/modelling-seasonal-data-with-gam/).
+
+```{r cyclic-knots}
 # for month cyclic cubic spline
 sknots <- list(month=c(0.5, 12.5))
+```
+
+```{r modelling}
 
 
 my.dets <-
@@ -338,7 +312,6 @@ for(i in 1:nrow(my.dets)) {
       data = my.dataset)
 
   # new censored model
-devtools::load_all("~/current/mgcvUtils")
   model.list.b$newcen[[my.dc]] <-
     bam(
       y ~
@@ -361,12 +334,7 @@ map_depth(model.list.b, 2, summary)
 # Making predictions
 
 
-we want to make some predictions over the date range of the data (no
-extrapolation) we are interested in patterns with and without the seasonality
-(month) component we could also include site id in our predictions but with a
-random intercept model
-the trend lines will be parallel so maybe not so useful
-individual site trends more useful with factor smooth models
+We want to make some predictions over the date range of the data (no extrapolation). We are interested in patterns with and without the seasonality (month) component.
 
 ```{r predictions, eval=FALSE}
 date.sequence <- expand_grid(year = 2000:2025, month = 1:12) |>
@@ -600,26 +568,6 @@ fv.observed |>
   geom_point(aes(x = gm.conc, y = residual), col = 'grey', pch = '+') +
   geom_vline(aes(xintercept = 2), col = 'red') +
   theme_bw()
-
-# using custom site + continuous time aware acf function across years
-# (generated using Copilot!)
-# conclusion - if this is correct is that there is significant residual
-# autocorrelation in the 0-3 months range
-# we ought to consider what to do about this!
-source("acf_across_sites.R")
-make_shortlag_acf(
-  data = fv.observed,
-  residual = residual,
-  site = samplingPoint.F,
-  date = DATE_DEC,
-  max_lag_years = 0.5,
-  bin_mode = "fixed",
-  bin_width_years = 7/365,  # ~weekly
-  n_bins = 10,
-  min_pairs = 30,
-  center.within = TRUE,
-  make_plot = TRUE,
-  smooth = TRUE
-)
-
 ```
+
+
