@@ -1,0 +1,531 @@
+---
+title: 'Modelling censored log-normal data in `mgcv`'
+author: "David L Miller and Michael Dunbar (Environment Agency)"
+date: "2026-03-02"
+format:
+  html:
+    math: mathjax
+  ipynb:
+    math: mathjax
+engine: knitr
+jupyter: r
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+Here I show how to model log-normally-distributed data. This kind of data often occurs in pollutant modelling where we have some concentration we are measuring which is bounded at zero, can be any positive value, and has a potentially skewed distribution. In that case, the log of the variable tends to look normally distributed.
+
+In this notebook, I'll show show to perform this modelling using the popular R package [`mgcv`](https://cran.r-project.org/package=mgcv). You can find out more about generalized additive models [here](https://training.bioss.ac.uk/course_materials/GAMintro2023/).
+
+
+# Preamble
+
+
+What does it mean to model log-normal data? What we are saying is that we have some variable, Y, which is $\log_{b}$-normally^[Throughout I use $\log_{b}$ to indicate logarithm to the base $b$ since these calculations work regardless of the base used.] When the distribution is referred to informally (i.e., non-mathematically) I drop the base. distributed so $Y\sim\log_{b}N(\mu,\sigma^{2})$ where $\mu$  is the logarithm of the mean and $\sigma^{2}$ is the base $b$ logarithm of the variance of $Y$. This is equivalent to defining a variable $Z=b^{Y}$ where $Z\sim N(\mu_{*},\sigma_{*}^{2})$. The log-normal distribution is useful in cases where $Y$ is defined over the interval $(0,\infty]$ (i.e., $Y>0$).
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r libs}
+library(dplyr)
+library(ggplot2)
+library(mgcv)
+library(tictoc)
+library(lubridate)
+library(tidyr)
+library(purrr)
+library(gratia)
+library(stringr)
+#remotes::install_github("christyray/sciscales")
+#remotes::install_local("O:/NCES Team/Evidence Synthesis/R/github/sciscales-main.zip")
+library(sciscales)
+```
+
+```{r data}
+# created in data_prep.R
+load('HMS from open data.rda')
+```
+
+
+```{r zeros}
+# as log-transforming we can't use zero as the lower bound for censored values
+# we just choose a very small value
+# 0.00012 is lowest non-censored PFOS value in this dataset
+nearly.zero <- 0.000001 # suggest at least 2 orders of magnitude below lowest lod
+log.zero <- log10(nearly.zero)
+```
+
+```{r detection-code}
+filter.det <- det.list[1]
+
+# reminder of which det code is which
+samples |>
+  group_by(determinand.notation, determinand.label, resultQualifier.notation) |>
+  tally() |>
+  pivot_wider(names_from = resultQualifier.notation, values_from = n)
+```
+
+
+```{r data-check}
+# data check
+# we can see that there are some LoDs whicih change over time
+samples |>
+  ggplot() +
+  geom_point(aes(x = sample.sampleDateTime,
+                 y = result,
+                 group = sample.samplingPoint.notation,
+                 col = resultQualifier.notation)) +
+  facet_wrap(~determinand.label, scales = 'free_y') +
+  scale_y_log10() + theme_bw()
+
+# PLOT SOME CDFS IN CASE WE WANT TO DO ARTIFICIAL CENSORING
+samples |>
+  ggplot() +
+  stat_ecdf(aes(y = result), geom = "step") +
+  facet_wrap(~determinand.label, scales = 'free_y') +
+  scale_y_log10() + theme_bw()
+
+# this only works for one determinand (currently nitrate)
+censoring.threshold <- 2
+
+samples.filtered <-
+  samples |>
+  filter(determinand.notation %in% det.list[1])
+
+# simple time series plot to look at LoDs
+samples.filtered |>
+  ggplot() +
+  geom_point(aes(x = sample.sampleDateTime, y = result, col = resultQualifier.notation), pch = '+') +
+  scale_y_log10() +
+  theme_bw()
+
+# tabulate LoDs
+samples.filtered |>
+  # can comment out
+  filter(resultQualifier.notation == '<') |>
+  group_by(result) |>
+  summarise(n = n())
+
+# conclusion - the predominant LoD in the original data is 0.196 although some
+# earlier data its 0.5
+# I think the value of <0.00001 is an error but leaving it in won't really
+# affect the models, just the residuals plots
+
+cen.copy <-
+  samples.filtered |>
+  mutate(result.original = result,
+         qualifier.original = resultQualifier.notation,
+         resultQualifier.notation = ifelse(result.original < censoring.threshold, '<', NA_character_),
+         result = ifelse(result.original < censoring.threshold, censoring.threshold, result),
+         determinand.notation = paste(determinand.notation, 'artificially censored')
+         )
+
+unique(samples$determinand.notation)
+
+# create some extra columns, also mgcv needs categorical variables to be factors
+samples.2 <-
+  bind_rows(samples.filtered, cen.copy) |>
+  mutate(DATE = date(sample.sampleDateTime),
+         year = year(DATE),
+         month = month(DATE),
+         #SAMP_ID = as.factor(SAMP_ID),
+         samplingPoint.F = as.factor(sample.samplingPoint.notation),
+         det.code.desc = paste(determinand.notation, determinand.label, sep = '-'),
+         DATE_DEC = round(decimal_date(DATE),2),
+         MEAS_SIGN = replace_na(resultQualifier.notation, '='),
+         log.meas.upper = log10(result + nearly.zero),
+         log.meas.lower = if_else(MEAS_SIGN == '<', log.zero, log.meas.upper),
+         censored = ifelse(MEAS_SIGN == '<', TRUE, FALSE),
+         # these two lines are because for the not artificially censored data,
+         # the ..original columns won't be populated yet
+         result.original = ifelse(is.na(result.original), result, result.original),
+         qualifier.original = ifelse(is.na(qualifier.original), resultQualifier.notation, qualifier.original)
+         )
+
+
+unique(samples.2$det.code.desc)
+
+# redo the ecdf check
+# the censored data starting with the vertical line is I think expected
+# behaviour it might not be the correct ecdf for the censored data but that's
+# not our concern here
+samples.2 |>
+  ggplot() +
+  stat_ecdf(aes(y = result), geom = "step", col = 'red') +
+ # stat_ecdf(aes(y = result.original), geom = "step", col = 'green') +
+  facet_wrap(~det.code.desc) +
+  ylim(1e-5, 30) +
+  scale_y_log10() + theme_bw()
+```
+
+
+```{r modelling}
+# -----------------------------------------------------------------------------
+# fit a gam model
+# overall aim to look at patterns of chlorophyll over time and relationship to
+# other variables including temperature
+# Had hoped to include the other inorganic nutrients as explanatory variables
+# but there are really too many <LoDs to use the data as-is
+
+
+# for month cyclic cubic spline
+sknots <- list(month=c(0.5, 12.5))
+
+# can choose either s(notation, bs = 're'), # for random intercepts (plus
+# separate common date term) or s(notation, DATE_DEC, bs = 'fs'),  #
+# factor-smooth = the gamm equivalent of random intercepts and slopes or
+# something more complex like a tensor product smooth
+
+# we want to look at any common trend across our monitoring sites
+
+# model working on the log scale but predictions can be back transformed to the
+# original scale later
+# we start off with just time trend and seasonality
+# we use bam and fREML for speed : maybe not necessary in this case but can be
+# for more complex models
+
+# 11/12/2025
+# added lines to fit both censored model (cen) and model to substituted data
+# for uncensored data these should give the same results
+# for artificially censored data we can compare the censored model output with
+# the raw uncensored data
+
+my.dets <-
+  samples.2 |>
+  distinct(det.code.desc)
+
+model.list.b <- list()
+
+
+# start loop --------------------------
+for(i in 1:nrow(my.dets)) {
+
+  my.dc <- my.dets$det.code.desc[i]
+
+  cat('-----------------------------------\n')
+  cat('Doing det: ', my.dc, "\n")
+
+  my.dataset <-
+    samples.2 |>
+    filter(det.code.desc == my.dc)
+
+  # needs setting up within the loop (ie for each dets separtely)
+  y <- cbind(my.dataset$log.meas.lower, my.dataset$log.meas.upper)
+
+  # censored models
+  model.list.b$cen[[my.dc]] <-
+    bam(
+      y ~
+        s(DATE_DEC, bs = 'cr') +
+        s(month, bs = 'cc') +
+        # can also allow seasonality to vary over time if required
+        s(samplingPoint.F, bs = 're'),
+      method = 'fREML',
+      family = cnorm(),
+      knots = sknots,
+      data = my.dataset)
+
+  # non censored models with substitution
+  model.list.b$sub[[my.dc]] <-
+    bam(
+      # we assume all <LoD measurements are at the LoD
+      log.meas.upper ~
+        s(DATE_DEC, bs = 'cr') +
+        s(month, bs = 'cc') +
+        # can also allow seasonality to vary over time if required
+        s(samplingPoint.F, bs = 're'),
+      method = 'fREML',
+      knots = sknots,
+      data = my.dataset)
+
+  # new censored model
+devtools::load_all("~/current/mgcvUtils")
+  model.list.b$newcen[[my.dc]] <-
+    bam(
+      y ~
+        s(DATE_DEC, bs = 'cr') +
+        s(month, bs = 'cc') +
+        # can also allow seasonality to vary over time if required
+        s(samplingPoint.F, bs = 're'),
+      method = 'fREML',
+      family = clognorm(base=10),
+      knots = sknots,
+      data = my.dataset)
+}
+```
+
+```{r model-summaries}
+# model summaries
+map_depth(model.list.b, 2, summary)
+```
+
+
+```{r predictions, eval=FALSE}
+
+# we want to make some predictions over the date range of the data (no
+# extrapolation) we are interested in patterns with and without the seasonality
+# (month) component we could also include site id in our predictions but with a
+# random intercept model
+# the trend lines will be parallel so maybe not so useful
+# individual site trends more useful with factor smooth models
+
+date.sequence <- expand_grid(year = 2000:2025, month = 1:12) |>
+  mutate(DATE_DEC = decimal_date(ymd(paste(year, month, '15', sep = '-')))) |>
+  # don't want to predict past September 2025 (even so, later data could be
+  # patchy)
+  filter(!(year == 2025 & month %in% c(10, 11,12))) |>
+  as.data.frame()
+
+
+# this is a version of our date sequence with an additional column for site
+# this is necessary because our model has site in it so the prediction matrix
+# needs it
+# !! this is the case even if we are going to exclude site from the predictions
+ds.1site <-
+  date.sequence |>
+  mutate(samplingPoint.F = samples.2$samplingPoint.F[1])
+
+# HELPER FUNCTIONS
+post_process_predictions <- function(pred.df) {
+  cols1 = c(gm.conc = '.fitted',
+            gm.lower.ci = '.lower_ci',
+            gm.upper.ci = '.upper_ci')
+  # cols2 = c(am.conc = '.fitted',
+  #           am.lower.ci = '.lower_ci',
+  #           am.upper.ci = '.upper_ci')
+
+  #exp(mu + sigma_squared / 2)
+
+  pp <-
+    pred.df |>
+    mutate(.var = .se ^2,
+           across(all_of(cols1), ~if_else(transform == 'log', 10^.x, .x)),
+           #across(all_of(cols2),
+           #       ~if_else(transform == 'log', 10^(.x + .var/2), .x)),
+           Date = ifelse(is.na(year), NA,
+                         decimal_date(ymd(paste(year, month, '15', sep='-')))),
+           season = factor(case_match(month,
+                                      3:5 ~ 'Spring',
+                                      6:8 ~ 'Summer',
+                                      9:11 ~ 'Autumn',
+                                      c(12,1,2) ~ 'Winter'),
+                           levels = c('Spring', 'Summer', 'Autumn', 'Winter')))
+
+  return(pp)
+}
+
+# note that it is OK to do exclude = '' or exclude = NULL, the exclude is then
+# just ignored
+build_exclude <- function(include_site_flag=FALSE, include_season_flag=TRUE){
+  out <- character(0)
+  if (!include_season_flag) out <- c(out, "s(month)")
+  if (!include_site_flag)  out <- c(out, "s(samplingPoint.F)")
+  out
+}
+
+
+predict_and_collate <-
+  function(my.data, my.model.list, include.site.flag = FALSE) {
+
+    cat('Making and collating predictions\n')
+
+    exclude.noseas <- build_exclude(include.site.flag,
+                                    include_season_flag = FALSE)
+    exclude.withseas <- build_exclude(include.site.flag,
+                                      include_season_flag = TRUE)
+
+    fv.list <- list()
+
+    cat('overall mean without seasonality\n')
+    fv.list[['Without season']] <-
+      fitted_values(my.model.list$bam.mod.a,
+                    data = my.data ,
+                    scale = "response",
+                    exclude = exclude.noseas)
+
+    cat('overall mean with seasonality\n')
+    fv.list[['With season']] <-
+      fitted_values(my.model.list$bam.mod.a,
+                    data = my.data,
+                    scale = "response",
+                    exclude = exclude.withseas)
+
+    fv <- fv.list |>
+      list_rbind(names_to = 'Prediction type') |>
+      # this column not used here: it's used in other cases where we're fitting
+      # some models to raw data and some to log data
+      mutate(transform = 'log') |>
+      post_process_predictions()
+
+    return(fv)
+
+  }
+
+# END OF HELPER FUNCTIONS
+
+# make predictions
+# separate loop for simplicity
+
+# we create a receptable for the predictions for each det
+super.fv.list <- list() # this always has site excluded
+observed.fv.list <- list()
+
+for(i in names(model.list.b)) {
+  for(j in my.dets$det.code.desc) {
+
+    cat('-----------------------------------\n')
+    cat('Doing model: ', i, ' Doing det: ', j, "\n")
+
+    super.fv.list[[i]][[j]] <-
+      # not strictly necessary to pass a list - this functionality left in in
+      # case we have more than one model formulation for each det
+      predict_and_collate(
+        ds.1site,
+        list(bam.mod.a = model.list.b[[i]][[j]]), include.site.flag = FALSE)
+
+    cat('predictions for observed data\n')
+    # this is a bit of a fudge: we pass the observed data to predict_and_collate
+    # we should note that when comparing with observed its the predictions with
+    # seasonality that are most relevant
+    # also here we are predicting for EVERY SITE so the output will be much
+    # bigger
+    observed.fv.list[[i]][[j]] <-
+      predict_and_collate(
+        samples.2 |> filter(det.code.desc == j),
+        list(bam.mod.a = model.list.b[[i]][[j]]), include.site.flag = TRUE)
+
+  }
+}
+
+# end up finally with one big data frame of predictions
+fv.final <-
+  super.fv.list |>
+  map(list_rbind, names_to = 'det.code.desc') |>
+  list_rbind(names_to = 'model.type') |>
+  # remove predictions for older PFOS data = don't trust the raw data from that
+  # period
+  filter(!(det.code.desc == '9276-PFOS' & year <= 2016 ))
+
+# reminder check what combinations we have
+fv.final |>
+  select(model.type, det.code.desc, `Prediction type`) |>
+  distinct()
+
+fv.observed <-
+  observed.fv.list |>
+  map(list_rbind, names_to = 'det.code.desc') |>
+  list_rbind(names_to = 'model.type') |>
+  filter(`Prediction type`== 'With season') |>
+  select(model.type, samplingPoint.F, det.code.desc, DATE_DEC, MEAS_SIGN,
+         log.meas.upper, log.meas.lower, gm.conc, gm.lower.ci, gm.upper.ci,
+         resultQualifier.notation, result, qualifier.original,
+         result.original) |>
+  mutate(residual = result.original - gm.conc)
+
+fv.observed |>
+  select(model.type, det.code.desc) |>
+  distinct()
+
+
+# 1. PLOT PREDICTIONS WITH fv.final - averaged across sites, regular time step,
+# with and without seasonality
+# we want to compare the 2 graphs in the top row and the 2 graphs in the  left
+# column
+# No need to compare the other combinations
+
+fv.final |>
+  # comment out if using facet_grid to show a 2x2 plot of dets and model/data
+  # types
+  # remember that with the original data, even when we substitute, there so
+  # little censoring it's basically the same dataset
+  #filter(model.type == 'cen') |>
+ggplot() +
+  # un-comment line to include raw data: <LoDs are plotted at the LoD (plot
+  # takes alot longer to render with the raw data)
+  #geom_point(data = samples.2, aes(x = DATE_DEC, y = result), col = 'grey',
+  #           alpha = 0.5, pch = '+') +
+  geom_line(aes(x = DATE_DEC, y = gm.conc, col = `Prediction type`))  +
+  geom_ribbon(aes(x = DATE_DEC, ymin = gm.lower.ci, ymax = gm.upper.ci, fill = `Prediction type`),
+              alpha = 0.2) +
+  #facet_wrap(~det.code.desc, ncol = 1, scales = 'free_y') +
+  facet_grid(rows = vars(model.type), cols = vars(det.code.desc)) +
+#  scale_y_log10(labels = label_sci()) +
+  scale_y_log10() +
+  scale_color_brewer(palette = 'Dark2') +
+  scale_fill_brewer(palette = 'Dark2', guide = 'none') +
+  labs(x = 'Date', y = 'Concentration', caption = 'Concentration units are mg/l for nutrients and (\u00b5g/l) for metals and chemicals') +
+  theme_bw() +
+  theme(legend.position = 'bottom')
+
+
+# PLOTTING original OBSERVED against the predictions for the censored model
+# remember the artificial censoring was applied at 2 mg/l but we retained the
+# original values as result.original
+# obviously the model won't be able to reproduce the range of the original data
+# and also this is a random intercept model, not a factor smooth model
+# fs will almost certainly be better but I didn't have time / computing power
+# to fit it
+# we're looking for potential bias both above and below the original detection
+# limit
+fv.observed |>
+  filter(model.type == 'cen') |>  # & det.code.desc == "0117 artificially censored-Nitrate-N") |>
+  # there are a minority of very low observed readings, I don't think we need
+  # to worry about these in this case
+  filter(result.original > 0.1) |>
+  # retain every xth row to speed up plotting
+  filter(row_number() %% 5 == 1) |>
+  ggplot() +
+  geom_point(aes(x = result.original, y = gm.conc), col = 'grey', pch = '+') +
+  geom_abline(aes(intercept = 0, slope = 1)) +
+  # original censoring
+  geom_vline(aes(xintercept = 2), col = 'red') +
+  facet_wrap(~det.code.desc) +
+  scale_x_log10() + scale_y_log10() +
+  coord_fixed(ratio = 1) +
+  theme_bw()
+
+# attempt to plot 'residuals'
+# conclusion - we are seeing some general pattern in residuals particularly
+# below the artificial LoD
+fv.observed |>
+  filter(model.type == 'cen' &
+         det.code.desc == "0117 artificially censored-Nitrate-N") |>
+  # there are a minority of very low observed readings, I don't think we need
+  # to worry about these in this case
+  #filter(result.original > 0.1) |>
+  filter(row_number() %% 5 == 1) |>
+  # these are 'residuals' in inverted commas because we're comparing original
+  # (virtually uncensored) values with
+  # predictions from a model where artificial censoring was introduced
+  mutate(residual = result.original - gm.conc) |>
+  ggplot() +
+  geom_point(aes(x = gm.conc, y = residual), col = 'grey', pch = '+') +
+  geom_vline(aes(xintercept = 2), col = 'red') +
+  theme_bw()
+
+# using custom site + continuous time aware acf function across years
+# (generated using Copilot!)
+# conclusion - if this is correct is that there is significant residual
+# autocorrelation in the 0-3 months range
+# we ought to consider what to do about this!
+source("acf_across_sites.R")
+make_shortlag_acf(
+  data = fv.observed,
+  residual = residual,
+  site = samplingPoint.F,
+  date = DATE_DEC,
+  max_lag_years = 0.5,
+  bin_mode = "fixed",
+  bin_width_years = 7/365,  # ~weekly
+  n_bins = 10,
+  min_pairs = 30,
+  center.within = TRUE,
+  make_plot = TRUE,
+  smooth = TRUE
+)
+
+```
