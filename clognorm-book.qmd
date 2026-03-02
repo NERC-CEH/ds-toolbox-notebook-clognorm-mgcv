@@ -177,11 +177,6 @@ samples |>
 
 The predominant LoD in the original data is 0.196 although some earlier data it is 0.5.
 
-```{r}
-# this only works for one determinand (currently nitrate)
-censoring.threshold <- 2
-```
-
 ## Final data prep
 
 When we log-transform we can't use zero as the lower bound for censored values
@@ -192,23 +187,14 @@ nearly.zero <- 0.000001
 log.zero <- log10(nearly.zero)
 ```
 
-```{r}
-cen.copy <-
-  samples |>
-  mutate(result.original = result,
-         qualifier.original = resultQualifier.notation,
-         resultQualifier.notation = ifelse(result.original < censoring.threshold, '<', NA_character_),
-         result = ifelse(result.original < censoring.threshold, censoring.threshold, result),
-         determinand.notation = paste(determinand.notation, 'artificially censored')
-         )
+Create some extra columns, ensure categorical variables are factors.
 
-# create some extra columns, also mgcv needs categorical variables to be factors
-samples.2 <-
-  bind_rows(samples, cen.copy) |>
+```{r}
+samples <-
+  samples |>
   mutate(DATE = date(sample.sampleDateTime),
          year = year(DATE),
          month = month(DATE),
-         #SAMP_ID = as.factor(SAMP_ID),
          samplingPoint.F = as.factor(sample.samplingPoint.notation),
          det.code.desc = paste(determinand.notation, determinand.label, sep = '-'),
          DATE_DEC = round(decimal_date(DATE),2),
@@ -218,41 +204,29 @@ samples.2 <-
          censored = ifelse(MEAS_SIGN == '<', TRUE, FALSE),
          # these two lines are because for the not artificially censored data,
          # the ..original columns won't be populated yet
-         result.original = ifelse(is.na(result.original), result, result.original),
-         qualifier.original = ifelse(is.na(qualifier.original), resultQualifier.notation, qualifier.original)
+         result.original = result,
+         qualifier.original = resultQualifier.notation
          )
+```
 
+Finally we create the response matrix, which is two columns (if entries are the same there was no censoring, if they are different there was censoring; see `?mgcv::cnorm`):
 
-# redo the ecdf check
-# the censored data starting with the vertical line is I think expected
-# behaviour it might not be the correct ecdf for the censored data but that's
-# not our concern here
-samples.2 |>
-  ggplot() +
-  stat_ecdf(aes(y = result), geom = "step", col = 'red') +
- # stat_ecdf(aes(y = result.original), geom = "step", col = 'green') +
-  facet_wrap(~det.code.desc) +
-  ylim(1e-5, 30) +
-  scale_y_log10() + theme_bw()
+```{r response}
+samples$y <- cbind(samples$log.meas.lower, samples$log.meas.upper)
+head(samples$y)
 ```
 
 # Modelling
 
-We can now fit our generalized additive model.
+We can now fit our generalized additive model. We want to fit a model of the following form:
 
-we want to look at any common trend across our monitoring sites
+\begin{equation*}
+\mathbb{E}(Y_i) = b^{\beta_0 + s(t_i) + s(m_i) + \beta_{z_i}}
+\end{equation*}
 
-model working on the log scale but predictions can be back transformed to the
-original scale later
-we start off with just time trend and seasonality
-we use bam and fREML for speed : maybe not necessary in this case but can be
-for more complex models
+where $i$ indexes the observations which have nitrate level $Y_i$ on date $t_i$ in month $m_i$ and station $z_i$ (where $\beta_{z}$ is a random intercept for station $z$). Generic smoothers are denoted $s()$. We want to look at any common trend across our monitoring sites, which will be in the terms $s(t_i)$ and $s(m_i)$. We use $b=10$ for this modelling, though any scientifically appropriate base would be usable with these functions/methods.
 
-11/12/2025
-added lines to fit both censored model (cen) and model to substituted data
-for uncensored data these should give the same results
-for artificially censored data we can compare the censored model output with
-the raw uncensored data
+Here we will use [`bam` and fREML](https://doi.org/10.1080/01621459.2016.1195744) for speed here to show that these methods work with large data approaches too.
 
 We need to setup knots for the monthly smoother. Note that we just need to specify the first and last knot, then `mgcv` will fill in evenly-spaced knots in that range. See [this useful blog post by Gavin Simpson about cyclic smoothing](https://fromthebottomoftheheap.net/2014/05/09/modelling-seasonal-data-with-gam/).
 
@@ -261,74 +235,22 @@ We need to setup knots for the monthly smoother. Note that we just need to speci
 sknots <- list(month=c(0.5, 12.5))
 ```
 
+We can now fit the model
+
 ```{r modelling}
-
-
-my.dets <-
-  samples.2 |>
-  distinct(det.code.desc)
-
-model.list.b <- list()
-
-
-for(i in 1:nrow(my.dets)) {
-
-  my.dc <- my.dets$det.code.desc[i]
-
-  cat('-----------------------------------\n')
-  cat('Doing det: ', my.dc, "\n")
-
-  my.dataset <-
-    samples.2 |>
-    filter(det.code.desc == my.dc)
-
-  # needs setting up within the loop (ie for each dets separtely)
-  y <- cbind(my.dataset$log.meas.lower, my.dataset$log.meas.upper)
-
-  # censored models
-  model.list.b$cen[[my.dc]] <-
-    bam(
-      y ~
-        s(DATE_DEC, bs = 'cr') +
-        s(month, bs = 'cc') +
-        # can also allow seasonality to vary over time if required
-        s(samplingPoint.F, bs = 're'),
-      method = 'fREML',
-      family = cnorm(),
-      knots = sknots,
-      data = my.dataset)
-
-  # non censored models with substitution
-  model.list.b$sub[[my.dc]] <-
-    bam(
-      # we assume all <LoD measurements are at the LoD
-      log.meas.upper ~
-        s(DATE_DEC, bs = 'cr') +
-        s(month, bs = 'cc') +
-        # can also allow seasonality to vary over time if required
-        s(samplingPoint.F, bs = 're'),
-      method = 'fREML',
-      knots = sknots,
-      data = my.dataset)
-
-  # new censored model
-  model.list.b$newcen[[my.dc]] <-
-    bam(
-      y ~
-        s(DATE_DEC, bs = 'cr') +
-        s(month, bs = 'cc') +
-        # can also allow seasonality to vary over time if required
-        s(samplingPoint.F, bs = 're'),
-      method = 'fREML',
-      family = clognorm(base=10),
-      knots = sknots,
-      data = my.dataset)
-}
+b <- bam(y ~ s(DATE_DEC, bs = 'cr') +
+             s(month, bs = 'cc') +
+             s(samplingPoint.F, bs = 're'),
+         method = 'fREML',
+         family = clognorm(base=10),
+         knots = sknots,
+         data = samples)
 ```
 
-```{r model-summaries}
-# model summaries
-map_depth(model.list.b, 2, summary)
+Looking at a summary output as usual. In particular we can see that we used the new `clognorm` family (see `Family:` line). This shows the base (10) and the standard deviation result.
+
+```{r model-summary}
+summary(b)
 ```
 
 # Making predictions
@@ -352,17 +274,16 @@ date.sequence <- expand_grid(year = 2000:2025, month = 1:12) |>
 ds.1site <-
   date.sequence |>
   mutate(samplingPoint.F = samples.2$samplingPoint.F[1])
+```
 
+
+
+```{r what, eval=FALSE}
 # HELPER FUNCTIONS
 post_process_predictions <- function(pred.df) {
   cols1 = c(gm.conc = '.fitted',
             gm.lower.ci = '.lower_ci',
             gm.upper.ci = '.upper_ci')
-  # cols2 = c(am.conc = '.fitted',
-  #           am.lower.ci = '.lower_ci',
-  #           am.upper.ci = '.upper_ci')
-
-  #exp(mu + sigma_squared / 2)
 
   pp <-
     pred.df |>
