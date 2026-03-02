@@ -13,22 +13,97 @@ execute:
   echo: true
   warning: false
   message: false
+  cache: true
+
 ---
-
-Here I show how to model log-normally-distributed data. This kind of data often occurs in pollutant modelling where we have some concentration we are measuring which is bounded at zero, can be any positive value, and has a potentially skewed distribution. In that case, the log of the variable tends to look normally distributed.
-
-In this notebook, I'll show show to perform this modelling using the popular R package [`mgcv`](https://cran.r-project.org/package=mgcv). You can find out more about generalized additive models [here](https://training.bioss.ac.uk/course_materials/GAMintro2023/).
-
-
-# Preamble
-
-
-What does it mean to model log-normal data? What we are saying is that we have some variable, Y, which is $\log_{b}$-normally^[Throughout I use $\log_{b}$ to indicate logarithm to the base $b$ since these calculations work regardless of the base used.] When the distribution is referred to informally (i.e., non-mathematically) I drop the base. distributed so $Y\sim\log_{b}N(\mu,\sigma^{2})$ where $\mu$  is the logarithm of the mean and $\sigma^{2}$ is the base $b$ logarithm of the variance of $Y$. This is equivalent to defining a variable $Z=b^{Y}$ where $Z\sim N(\mu_{*},\sigma_{*}^{2})$. The log-normal distribution is useful in cases where $Y$ is defined over the interval $(0,\infty]$ (i.e., $Y>0$).
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
+Here I show how to model censored log-normally-distributed data. This kind of data often occurs in pollutant modelling where we have some concentration we are measuring which is a positive value, has a potentially skewed distribution, and might be censored at some limit for detection. In that case, the log of the variable tends to look normally distributed. In this case we can model the data as normally distributed, applying the appropriate transformation at the end of the analysis. Unfortunately this implies a [geometric rather than arithmetic mean](https://en.wikipedia.org/wiki/AM%E2%80%93GM_inequality), which can be difficult to compare to other modelling results.
+
+In this notebook, I'll show show to perform this modelling using the popular R package [`mgcv`](https://cran.r-project.org/package=mgcv). You can find out more about generalized additive models [here](https://training.bioss.ac.uk/course_materials/GAMintro2023/). The methods shown here correct for the bias be incur by transforming predictions, ensuring that results are comparable to other modelling that uses the arithmetic mean.
+
+
+# Modelling preamble
+
+
+What does it mean to model log-normal data? What we are saying is that we have some variable, Y, which is $\log_{b}$-normally^[Throughout I use $\log_{b}$ to indicate logarithm to the base $b$ since these calculations work regardless of the base used. When the distribution is referred to informally (i.e., non-mathematically) I drop the base.] distributed so $Y\sim\log_{b}N(\mu,\sigma^{2})$ where $\mu$  is the logarithm of the mean and $\sigma^{2}$ is the base $b$ logarithm of the variance of $Y$. This is equivalent to defining a variable $Z=b^{Y}$ where $Z\sim N(\mu_{*},\sigma_{*}^{2})$. The log-normal distribution is useful in cases where $Y$ is defined over the interval $(0,\infty]$ (i.e., $Y>0$).
+
+
+## Arithmetic versus geometric means
+
+We can estimate estimate the expectation of $Y$ ($\mathbb{E}(Y)$) by either an arithmetic or geometric mean (denoted $\mathbb{E}_{A}(Y)$ or $\mathbb{E}_{G}(Y)$, respectively). These are defined as: 
+
+\begin{align}
+\mathbb{E}_{A}(Y) &=b^{\mu+\frac{1}{2}\sigma^{2}}\quad\text{and} \\
+\mathbb{E}_{G}(Y) &=b^{\mu}.
+\end{align}
+
+Where the geometric “mean” corresponds to the median of the distribution. This difference is shown in the following plot
+
+```{r am-gm-fig}
+library(ggplot2)
+
+xx <- seq(0, 8, length.out=300)
+
+dat <- data.frame(x = c(xx, xx),
+                  dl = c(dlnorm(xx, 0, 1),
+                         dlnorm(xx, 1, 1/2)),
+                  pars = rep(c("0, 1", "1, 1/2"), c(300,300)))
+
+pardat <- data.frame(pars = rep(c("0, 1", "1, 1/2"), c(2,2)),
+                     method = rep(c("Arithmetic", "Geometric"),
+                                  2),
+                     value = exp(c(0+1/2*1^2, 0,
+                               1+1/2*1/2^2, 1)))
+
+ggplot(dat) +
+  geom_line(aes(x=x, y=dl, group=pars, colour=pars)) +
+  geom_vline(aes(xintercept=value, lty=method, group=pars,
+                 colour=pars), data=pardat) +
+  labs(x="x", y="Probability density", colour="Parameters",
+       lty="Estimator") +
+  theme_minimal()
+```
+
+Similarly, we define the arithmetic and geometric standard deviations as follows:
+
+\begin{align}
+\text{SD}_{A}(Y) &=b^{\mu+\frac{1}{2}\sigma^{2}}\sqrt{b^{\sigma^{2}}-1}\\
+\text{SD}_{G}(Y) &=b^{\sigma}.
+\end{align}
+
+This is all fine in the simple case where we're just estimating the distribution parameters, with no covariates involved. What about when we want to use covariates for prediction?
+
+## log-normal response in regression-like models
+
+We may want to model the mean via some linear model, for example when using a GLM or GAM. We decompose the mean as $\mathbf{X}\boldsymbol{\beta}$, where $\mathbf{X}$ is an $n\times p$ design matrix and $\boldsymbol{\beta}$ is a $p$-vector of coefficients to be estimated (where n is the number of observations).
+
+In practice, one can simply assume that the log-response is normally distributed and fit a GLM-a-like (GAM/GLMM/GAMM/etc) with a normal distribution. This model is:
+
+\begin{equation*}
+\mathbb{E}(Y)=b^{\mu}=b^{\mathbf{X}\boldsymbol{\beta}},
+\end{equation*}
+
+which is clearly modelling the geometric, rather than arithmetic mean (equivalently, we are modelling the median). This naturally extends to the case of random effects and therefore penalized smoothers (i.e., GLMMs, GAMs and GAMMs).
+
+We can post hoc correct predictions to use the arithmetic mean using a multivariate version of the corrections above. These corrections lead to the following expressions:
+
+\begin{align*}
+\mathbb{E} \left[ g \left( \hat{\boldsymbol{\beta}} \right) \right] &= g\left( \hat{\boldsymbol{\beta}} \right) + \frac{1}{2n}\text{trace}\left(D^{2}g(\hat{\boldsymbol{\beta}})\Sigma\right)\quad\text{and}\\
+\hat{\text{Var}}\left[g\left(\hat{\boldsymbol{\beta}}\right)\right] & = \frac{1}{n}\left[Dg(\boldsymbol{\beta})\right]{}^{T}\Sigma(Dg(\boldsymbol{\beta})) -\frac{1}{2n^{2}}\text{trace}\left(D^{3}g(\boldsymbol{\beta})D^{2}g(\boldsymbol{\beta})\Sigma^{2}-\left[D^{2}g(\boldsymbol{\beta})\Sigma\right]^{2}\right)
+\end{align*}
+
+where $g(\boldsymbol{\beta})=b^{X\boldsymbol{\beta}}$ if $b$ is the base we are working in and $X$ is the design matrix for our model. $D$ indicates the derivative operator with respect to $\boldsymbol{\beta}$, with powers of $D$ giving that order of derivative. $\Sigma$  is the posterior covariance matrix for $\boldsymbol{\beta}$ (see, e.g. [Miller (2025)](https://doi.org/10.1111/2041-210X.14498) for further explanation of covariance matrices in the context of empirical Bayes modelling).
+
+
+
+
+# Analysis of pollutant data
+
+We begin by loading the requisite packages.
 
 ```{r libs}
 library(dplyr)
@@ -40,21 +115,29 @@ library(tidyr)
 library(purrr)
 library(gratia)
 library(stringr)
-#remotes::install_github("christyray/sciscales")
-#remotes::install_local("O:/NCES Team/Evidence Synthesis/R/github/sciscales-main.zip")
-library(sciscales)
 ```
+
+There are some non-CRAN packages required which we can install directly from GitHub, then load:
+
+```{r extra-libs}
+remotes::install_github("christyray/sciscales")
+library(sciscales)
+remotes::install_github("dill/mgcvUtils")
+library(mgcvUtils)
+```
+
+Michael Dunbar at the Environment Agency pre-prepared data for this analysis using open data from EA.
 
 ```{r data}
 # created in data_prep.R
-load('HMS from open data.rda')
+load('HMS_open_data.rda')
 ```
 
+as log-transforming we can't use zero as the lower bound for censored values
+we just choose a very small value
+0.00012 is lowest non-censored PFOS value in this dataset
 
 ```{r zeros}
-# as log-transforming we can't use zero as the lower bound for censored values
-# we just choose a very small value
-# 0.00012 is lowest non-censored PFOS value in this dataset
 nearly.zero <- 0.000001 # suggest at least 2 orders of magnitude below lowest lod
 log.zero <- log10(nearly.zero)
 ```
@@ -70,9 +153,11 @@ samples |>
 ```
 
 
+## Data checking
+
 ```{r data-check}
 # data check
-# we can see that there are some LoDs whicih change over time
+# we can see that there are some LoDs which change over time
 samples |>
   ggplot() +
   geom_point(aes(x = sample.sampleDateTime,
@@ -81,13 +166,18 @@ samples |>
                  col = resultQualifier.notation)) +
   facet_wrap(~determinand.label, scales = 'free_y') +
   scale_y_log10() + theme_bw()
+```
 
+```{r}
 # PLOT SOME CDFS IN CASE WE WANT TO DO ARTIFICIAL CENSORING
 samples |>
   ggplot() +
   stat_ecdf(aes(y = result), geom = "step") +
   facet_wrap(~determinand.label, scales = 'free_y') +
   scale_y_log10() + theme_bw()
+```
+
+```{r}
 
 # this only works for one determinand (currently nitrate)
 censoring.threshold <- 2
@@ -102,6 +192,9 @@ samples.filtered |>
   geom_point(aes(x = sample.sampleDateTime, y = result, col = resultQualifier.notation), pch = '+') +
   scale_y_log10() +
   theme_bw()
+```
+
+```{r}
 
 # tabulate LoDs
 samples.filtered |>
@@ -109,12 +202,18 @@ samples.filtered |>
   filter(resultQualifier.notation == '<') |>
   group_by(result) |>
   summarise(n = n())
+```
 
-# conclusion - the predominant LoD in the original data is 0.196 although some
-# earlier data its 0.5
-# I think the value of <0.00001 is an error but leaving it in won't really
-# affect the models, just the residuals plots
 
+conclusion - the predominant LoD in the original data is 0.196 although some
+earlier data its 0.5
+I think the value of <0.00001 is an error but leaving it in won't really
+affect the models, just the residuals plots
+
+## Final data prep
+
+
+```{r}
 cen.copy <-
   samples.filtered |>
   mutate(result.original = result,
@@ -162,37 +261,34 @@ samples.2 |>
   scale_y_log10() + theme_bw()
 ```
 
+# Modelling
+
+We can now fit a generalized additive model.
+
+
+overall aim to look at patterns of chlorophyll over time and relationship to
+other variables including temperature
+Had hoped to include the other inorganic nutrients as explanatory variables
+but there are really too many LoDs to use the data as-is
+
+we want to look at any common trend across our monitoring sites
+
+model working on the log scale but predictions can be back transformed to the
+original scale later
+we start off with just time trend and seasonality
+we use bam and fREML for speed : maybe not necessary in this case but can be
+for more complex models
+
+11/12/2025
+added lines to fit both censored model (cen) and model to substituted data
+for uncensored data these should give the same results
+for artificially censored data we can compare the censored model output with
+the raw uncensored data
 
 ```{r modelling}
-# -----------------------------------------------------------------------------
-# fit a gam model
-# overall aim to look at patterns of chlorophyll over time and relationship to
-# other variables including temperature
-# Had hoped to include the other inorganic nutrients as explanatory variables
-# but there are really too many <LoDs to use the data as-is
-
-
 # for month cyclic cubic spline
 sknots <- list(month=c(0.5, 12.5))
 
-# can choose either s(notation, bs = 're'), # for random intercepts (plus
-# separate common date term) or s(notation, DATE_DEC, bs = 'fs'),  #
-# factor-smooth = the gamm equivalent of random intercepts and slopes or
-# something more complex like a tensor product smooth
-
-# we want to look at any common trend across our monitoring sites
-
-# model working on the log scale but predictions can be back transformed to the
-# original scale later
-# we start off with just time trend and seasonality
-# we use bam and fREML for speed : maybe not necessary in this case but can be
-# for more complex models
-
-# 11/12/2025
-# added lines to fit both censored model (cen) and model to substituted data
-# for uncensored data these should give the same results
-# for artificially censored data we can compare the censored model output with
-# the raw uncensored data
 
 my.dets <-
   samples.2 |>
@@ -201,7 +297,6 @@ my.dets <-
 model.list.b <- list()
 
 
-# start loop --------------------------
 for(i in 1:nrow(my.dets)) {
 
   my.dc <- my.dets$det.code.desc[i]
@@ -263,16 +358,17 @@ devtools::load_all("~/current/mgcvUtils")
 map_depth(model.list.b, 2, summary)
 ```
 
+# Making predictions
+
+
+we want to make some predictions over the date range of the data (no
+extrapolation) we are interested in patterns with and without the seasonality
+(month) component we could also include site id in our predictions but with a
+random intercept model
+the trend lines will be parallel so maybe not so useful
+individual site trends more useful with factor smooth models
 
 ```{r predictions, eval=FALSE}
-
-# we want to make some predictions over the date range of the data (no
-# extrapolation) we are interested in patterns with and without the seasonality
-# (month) component we could also include site id in our predictions but with a
-# random intercept model
-# the trend lines will be parallel so maybe not so useful
-# individual site trends more useful with factor smooth models
-
 date.sequence <- expand_grid(year = 2000:2025, month = 1:12) |>
   mutate(DATE_DEC = decimal_date(ymd(paste(year, month, '15', sep = '-')))) |>
   # don't want to predict past September 2025 (even so, later data could be
@@ -304,8 +400,6 @@ post_process_predictions <- function(pred.df) {
     pred.df |>
     mutate(.var = .se ^2,
            across(all_of(cols1), ~if_else(transform == 'log', 10^.x, .x)),
-           #across(all_of(cols2),
-           #       ~if_else(transform == 'log', 10^(.x + .var/2), .x)),
            Date = ifelse(is.na(year), NA,
                          decimal_date(ymd(paste(year, month, '15', sep='-')))),
            season = factor(case_match(month,
