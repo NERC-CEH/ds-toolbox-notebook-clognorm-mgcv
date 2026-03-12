@@ -1,7 +1,7 @@
 ---
 title: 'Modelling censored log-normal data in `mgcv`'
-author: "David L Miller and Michael Dunbar (Environment Agency)"
-date: "2026-03-02"
+author: "David L Miller"
+date: "2026-03-11"
 format:
   html:
     math: mathjax
