@@ -246,7 +246,6 @@ sknots <- list(month=c(0.5, 12.5))
 We can now fit the model
 
 ```{r modelling}
-devtools::load_all("~/current/mgcvUtils")
 b <- bam(y ~ s(DATE_DEC, bs = 'cr') +
              s(month, bs = 'cc') +
              s(samplingPoint.F, bs = 're'),
