@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use this vignette, please cite it as below."
+authors:
+  - family-names: Miller
+    given-names: David Lawrence
+    orcid: https://orcid.org/0000-0002-9640-6755
+title: "Data science toolbox: censored log-normal distributions in mgcv"
+version: 1.0.0
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.19000349
+date-released: 2026-03-13
