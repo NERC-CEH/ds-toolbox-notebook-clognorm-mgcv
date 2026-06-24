@@ -212,11 +212,15 @@ samples <-
 Finally we create the response matrix, which is two columns (if entries are the same there was no censoring, if they are different there was censoring; see `?mgcv::cnorm`):
 
 ```{r response}
-samples$y <- cbind(samples$log.meas.lower, samples$log.meas.upper)
+samples$y <- cbind(10^samples$log.meas.lower, 10^samples$log.meas.upper)
+samples$logy <- cbind(samples$log.meas.lower, samples$log.meas.upper)
 head(samples$y)
 ```
 
-Note that although we pass a matrix to `mgcv` as the response, we only have a univariate response variable, the second column is only for indicating censoring to the code.
+Notes:
+
+1. although we pass a matrix to `mgcv` as the response, we only have a univariate response variable, the second column is only for indicating censoring to the code.
+2. `clognorm` will apply `logb(response, base)` to the response variable (here `y`) whereas for the `cnorm` we need to have the variable already on the log scale (as it was in the previous code chunk). So, for `cnorm` we'll use the `logy` variable and for `clognorm` we will use `y`.
 
 # Modelling
 
@@ -255,7 +259,7 @@ b <- bam(y ~ s(DATE_DEC, bs = 'cr') +
          data = samples)
 
 
-b_uncorrected <- bam(y ~ s(DATE_DEC, bs = 'cr') +
+b_uncorrected <- bam(logy ~ s(DATE_DEC, bs = 'cr') +
                          s(month, bs = 'cc') +
                          s(samplingPoint.F, bs = 're'),
                          method = 'fREML',
@@ -297,7 +301,7 @@ predgrid$pred <- predict(b, predgrid, type="response",
                          exclude=c("s(samplingPoint.F)", "s(DATE_DEC)"))
 ```
 
-We can add a confidence band around this plot by manually calculating the upper and lower bounds, but `mgcvUtils` also provides a function to do this for you in an analogous way to the [`gratia`](https://gavinsimpson.github.io/gratia/) package, via the `fitted_values_clognorm` function^[Note that the `fitted_values` function in `gratia` will not work with the `clognorm` family at this time.].
+We can add a confidence band around this plot by manually calculating the upper and lower bounds, but `mgcvUtils` also provides a function to do this for you in an analogous way to the [`gratia`](https://gavinsimpson.github.io/gratia/) package, via the `fitted_values_clognorm` function^[Note that the `fitted_values` function in `gratia` on CRAN will not work with the `clognorm` family at this time. The development version now supports `clognorm`, thanks to Gavin Simpson for this.].
 
 ```{r fittedvals}
 fv <- fitted_values_clognorm(b, predgrid, scale="response",
@@ -326,9 +330,11 @@ We can now compare these graphically:
 
 ```{r complot}
 ggplot(fv) +
+  # uncorrected (cnorm)
   geom_ribbon(aes(x=DATE_DEC, ymin=10^.lower_ci, ymax=10^.upper_ci),
               fill="blue", alpha=0.4, data=fv_gm) +
   geom_line(aes(x=DATE_DEC, y=10^.fitted), lty=2, data=fv_gm, colour="blue") +
+  # corrected (clognorm)
   geom_ribbon(aes(x=DATE_DEC, ymin=.lower_ci, ymax=.upper_ci),
               fill="red", alpha=0.4) +
   geom_line(aes(x=DATE_DEC, y=.fitted), colour="red") +
